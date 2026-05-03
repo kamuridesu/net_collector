@@ -1,8 +1,8 @@
 # Network Data Collector
 
-A lightweight C++ utility designed to monitor and collect real-time network performance metrics. This tool is specifically tailored for evaluating internet service provider (ISP) quality by measuring latency, jitter, and DNS performance across popular web services.
+A C++ tool designed to collect network metrics. This tool is specifically tailored for evaluating internet service provider (ISP) quality by measuring latency, jitter, and DNS performance across popular web services.
 
-## 🚀 Features
+## Features
 
 - **Multi-Site Monitoring**: Automatically tests connectivity to major platforms:
   - Google
@@ -20,7 +20,7 @@ A lightweight C++ utility designed to monitor and collect real-time network perf
   - **JSON Export**: Automatically saves all results to `network_data.json` for easy integration with web dashboards or analysis tools.
 - **Windows Optimized**: Uses native Win32 APIs and WinSock2 for accurate system-level data.
 
-## 🛠️ Requirements
+## Requirements
 
 - **Operating System**: Windows 10/11
 - **Compiler**: GCC (MinGW-w64) or MSVC
@@ -28,7 +28,7 @@ A lightweight C++ utility designed to monitor and collect real-time network perf
   - `Ws2_32.lib` (Windows Sockets)
   - `Iphlpapi.lib` (IP Helper API)
 
-## 📦 Compilation
+## Compilation
 
 To compile the project using G++, run the following command in your terminal:
 
@@ -42,7 +42,7 @@ windres resource.rc -O coff -o resource.res
 g++ main.cpp resource.res -o net_collector.exe -lws2_32 -liphlpapi
 ```
 
-## 📊 Output Format
+## Output Format
 
 The tool generates a `network_data.json` file structured as follows:
 
@@ -65,6 +65,6 @@ The tool generates a `network_data.json` file structured as follows:
 ]
 ```
 
-## 📝 License
+## License
 
 This project is open-source and intended for personal network diagnostic use.
