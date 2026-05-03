@@ -212,7 +212,7 @@ int main() {
             "instagram.com",
             "steampowered.com",
             "roblox.com",
-            "leagueoflegends.com"
+            "www.fortnite.com"
         };
 
         std::vector<SiteMetrics> results;
