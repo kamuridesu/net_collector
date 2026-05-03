@@ -14,6 +14,15 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
+#include <future>
+#include <thread>
+#include <atomic>
+#include <mutex>
+
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+
+std::mutex console_mutex;
 
 struct SiteMetrics {
     std::string domain;
@@ -24,7 +33,42 @@ struct SiteMetrics {
     int packet_loss = 0;
     std::string dns_server_address;
     double dns_resolution_time_ms = 0;
+    bool unreachable = false;
+    bool dns_success = false;
 };
+
+class WSASession {
+public:
+    WSASession() {
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            throw std::runtime_error("WSAStartup failed");
+        }
+    }
+    ~WSASession() {
+        WSACleanup();
+    }
+};
+
+std::string escape_json(const std::string& s) {
+    std::ostringstream o;
+    for (auto c : s) {
+        if (c == '"') o << "\\\"";
+        else if (c == '\\') o << "\\\\";
+        else if ((unsigned char)c <= '\x1f') {
+            o << "\\u" << std::hex << std::setw(4) << std::setfill('0') << (int)(unsigned char)c;
+        } else {
+            o << c;
+        }
+    }
+    return o.str();
+}
+
+bool isValidDomain(const std::string& domain) {
+    std::regex domain_regex("^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\\.)+[a-zA-Z]{2,}$");
+    std::regex ip_regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}$");
+    return std::regex_match(domain, domain_regex) || std::regex_match(domain, ip_regex);
+}
 
 std::string exec(const char* cmd) {
     std::array<char, 128> buffer;
@@ -40,9 +84,13 @@ std::string exec(const char* cmd) {
 }
 
 void parsePing(const std::string& output, SiteMetrics& metrics) {
-    std::regex time_regex("tempo[=<]([0-9]+)ms");
-    if (output.find("time=") != std::string::npos) {
+    bool is_english = (output.find("Average =") != std::string::npos || output.find("time=") != std::string::npos);
+    
+    std::regex time_regex;
+    if (is_english) {
         time_regex = std::regex("time[=<]([0-9]+)ms");
+    } else {
+        time_regex = std::regex("tempo[=<]([0-9]+)ms");
     }
 
     std::vector<double> latencies;
@@ -54,6 +102,12 @@ void parsePing(const std::string& output, SiteMetrics& metrics) {
         latencies.push_back(std::stod(match[1].str()));
     }
 
+    if (latencies.empty()) {
+        metrics.unreachable = true;
+        metrics.packet_loss = 100;
+        return;
+    }
+
     if (latencies.size() > 1) {
         double total_diff = 0;
         for (size_t i = 1; i < latencies.size(); ++i) {
@@ -62,25 +116,21 @@ void parsePing(const std::string& output, SiteMetrics& metrics) {
         metrics.jitter = total_diff / (latencies.size() - 1);
     }
 
-    std::regex ms_regex("= ([0-9]+)ms");
-    std::vector<double> summary_stats;
-    auto summary_begin = std::sregex_iterator(output.begin(), output.end(), ms_regex);
-    auto summary_end = std::sregex_iterator();
-    
-    for (std::sregex_iterator i = summary_begin; i != summary_end; ++i) {
-        std::smatch match = *i;
-        summary_stats.push_back(std::stod(match[1].str()));
+    std::regex summary_regex;
+    if (is_english) {
+        summary_regex = std::regex("Minimum = ([0-9]+)ms, Maximum = ([0-9]+)ms, Average = ([0-9]+)ms");
+    } else {
+        summary_regex = std::regex("M[íi]nimo = ([0-9]+)ms, M[áa]ximo = ([0-9]+)ms, M[ée]dia = ([0-9]+)ms");
     }
 
-    if (summary_stats.size() >= 3) {
-        metrics.avg_lat = summary_stats.back();
-        summary_stats.pop_back();
-        metrics.max_lat = summary_stats.back();
-        summary_stats.pop_back();
-        metrics.min_lat = summary_stats.back();
+    std::smatch summary_match;
+    if (std::regex_search(output, summary_match, summary_regex)) {
+        metrics.min_lat = std::stod(summary_match[1].str());
+        metrics.max_lat = std::stod(summary_match[2].str());
+        metrics.avg_lat = std::stod(summary_match[3].str());
     }
 
-    std::regex loss_regex("([0-9]+)%");
+    std::regex loss_regex("\\(([0-9]+)%");
     std::smatch loss_match;
     if (std::regex_search(output, loss_match, loss_regex)) {
         metrics.packet_loss = std::stoi(loss_match[1].str());
@@ -89,12 +139,15 @@ void parsePing(const std::string& output, SiteMetrics& metrics) {
 
 std::string getDnsServer() {
     std::string dns_server = "Unknown";
-    FIXED_INFO *pFixedInfo = (FIXED_INFO *) malloc(sizeof(FIXED_INFO));
     ULONG ulOutBufLen = sizeof(FIXED_INFO);
+    FIXED_INFO *pFixedInfo = (FIXED_INFO *) malloc(ulOutBufLen);
     
+    if (!pFixedInfo) return dns_server;
+
     if (GetNetworkParams(pFixedInfo, &ulOutBufLen) == ERROR_BUFFER_OVERFLOW) {
         free(pFixedInfo);
         pFixedInfo = (FIXED_INFO *) malloc(ulOutBufLen);
+        if (!pFixedInfo) return dns_server;
     }
     
     if (GetNetworkParams(pFixedInfo, &ulOutBufLen) == NO_ERROR) {
@@ -108,99 +161,199 @@ void printDashboardHeader() {
     std::cout << "\n================================================================" << std::endl;
     std::cout << " NETWORK DATA COLLECTOR v1.1 " << std::endl;
     std::cout << "================================================================" << std::endl;
-    std::cout << std::left << std::setw(20) << "Domain" 
+    std::cout << std::left << std::setw(25) << "Domain" 
               << std::setw(15) << "Lat(min/avg/max)" 
               << std::setw(10) << "Jitter" 
               << std::setw(8) << "Loss" 
               << "DNS Time" << std::endl;
-    std::cout << "----------------------------------------------------------------" << std::endl;
+    std::cout << "---------------------------------------------------------------------" << std::endl;
 }
 
 void printSiteData(const SiteMetrics& m) {
-    std::string lat_str = std::to_string((int)m.min_lat) + "/" + std::to_string((int)m.avg_lat) + "/" + std::to_string((int)m.max_lat);
-    std::cout << std::left << std::setw(20) << m.domain 
+    std::lock_guard<std::mutex> lock(console_mutex);
+    std::string lat_str;
+    if (m.unreachable) {
+        lat_str = "TIMEOUT";
+    } else {
+        lat_str = std::to_string((int)m.min_lat) + "/" + std::to_string((int)m.avg_lat) + "/" + std::to_string((int)m.max_lat);
+    }
+
+    std::string dns_time = m.dns_success ? (std::to_string((int)m.dns_resolution_time_ms) + "ms") : "N/A";
+
+    std::cout << std::left << std::setw(25) << m.domain 
               << std::setw(15) << lat_str
               << std::fixed << std::setprecision(1) << std::setw(10) << m.jitter
               << std::setw(8) << (std::to_string(m.packet_loss) + "%")
-              << std::fixed << std::setprecision(2) << m.dns_resolution_time_ms << "ms" << std::endl;
+              << dns_time << std::endl;
+}
+
+void showSpinner(std::atomic<bool>& done, const std::string& msg) {
+    const char spinner[] = {'|', '/', '-', '\\'};
+    int i = 0;
+    while (!done) {
+        {
+            std::lock_guard<std::mutex> lock(console_mutex);
+            std::cout << "\r" << msg << " " << spinner[i % 4] << "  " << std::flush;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        i++;
+    }
+    {
+        std::lock_guard<std::mutex> lock(console_mutex);
+        std::cout << "\r" << std::string(msg.length() + 10, ' ') << "\r" << std::flush;
+    }
+}
+
+SiteMetrics processSite(const std::string& domain, const std::string& default_dns) {
+    SiteMetrics metrics;
+    metrics.domain = domain;
+
+    if (!isValidDomain(domain)) {
+        metrics.unreachable = true;
+        metrics.packet_loss = 100;
+        return metrics;
+    }
+
+    std::string ping_cmd = "ping " + domain + " -n 20";
+    std::string ping_out = exec(ping_cmd.c_str());
+    parsePing(ping_out, metrics);
+
+    metrics.dns_server_address = default_dns;
+
+    std::regex ip_regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}$");
+    if (std::regex_match(domain, ip_regex)) {
+        metrics.dns_success = false;
+        return metrics;
+    }
+
+    auto shared_hints = std::make_shared<addrinfo>();
+    
+    ZeroMemory(shared_hints.get(), sizeof(addrinfo));
+    shared_hints->ai_family = AF_UNSPEC;
+    shared_hints->ai_socktype = SOCK_STREAM;
+    shared_hints->ai_protocol = IPPROTO_TCP;
+
+    struct DnsTaskResult { int ret; double duration_ms; };
+    auto dns_future = std::async(std::launch::async, [=]() {
+        auto start = std::chrono::high_resolution_clock::now();
+        struct addrinfo* res = nullptr;
+        int r = getaddrinfo(domain.c_str(), "80", shared_hints.get(), &res);
+        auto end = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(end - start).count();
+        if (res) freeaddrinfo(res);
+        return DnsTaskResult{r, ms};
+    });
+
+    if (dns_future.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
+        metrics.dns_success = false;
+    } else {
+        DnsTaskResult res = dns_future.get();
+        if (res.ret == 0) {
+            metrics.dns_success = true;
+            metrics.dns_resolution_time_ms = res.duration_ms;
+        } else {
+            metrics.dns_success = false;
+        }
+    }
+
+    return metrics;
 }
 
 int main() {
-    std::vector<std::string> sites = {
-        "google.com",
-        "tiktok.com",
-        "web.whatsapp.com",
-        "uol.com.br",
-        "chatgpt.com"
-    };
-
-    std::vector<SiteMetrics> results;
-
-    WSADATA wsaData;
-    WSAStartup(MAKEWORD(2, 2), &wsaData);
-    std::string default_dns = getDnsServer();
-
-    printDashboardHeader();
-
-    for (const auto& domain : sites) {
-        SiteMetrics metrics;
-        metrics.domain = domain;
-
-        std::string ping_cmd = "ping " + domain + " -n 10";
-        std::string ping_out = exec(ping_cmd.c_str());
-        parsePing(ping_out, metrics);
-
-        metrics.dns_server_address = default_dns;
-
-        auto start = std::chrono::high_resolution_clock::now();
-        struct addrinfo *result = NULL;
-        struct addrinfo hints;
-        ZeroMemory(&hints, sizeof(hints));
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        hints.ai_protocol = IPPROTO_TCP;
+    try {
+        WSASession wsa;
         
-        DWORD dwRetval = getaddrinfo(domain.c_str(), "80", &hints, &result);
-        auto end = std::chrono::high_resolution_clock::now();
-        
-        if (dwRetval == 0) {
-            freeaddrinfo(result);
+        std::vector<std::string> sites = {
+            "google.com",
+            "tiktok.com",
+            "web.whatsapp.com",
+            "uol.com.br",
+            "chatgpt.com",
+            "x.com",
+            "speed.cloudflare.com",
+            "youtube.com",
+            "fast.com",
+            "amazon.com.br",
+            "globo.com",
+            "instagram.com",
+            "steampowered.com",
+            "roblox.com",
+            "leagueoflegends.com"
+        };
+
+        std::vector<SiteMetrics> results;
+        std::string default_dns = getDnsServer();
+
+        printDashboardHeader();
+
+        for (size_t i = 0; i < sites.size(); i += 5) {
+            std::vector<std::future<SiteMetrics>> futures;
+            std::atomic<bool> batch_done(false);
+            
+            std::string batch_msg = "Processing batch " + std::to_string((i / 5) + 1) + " of " + std::to_string((sites.size() + 4) / 5) + "...";
+            std::thread spinner_thread(showSpinner, std::ref(batch_done), batch_msg);
+
+            for (size_t j = i; j < i + 5 && j < sites.size(); ++j) {
+                futures.push_back(std::async(std::launch::async, processSite, sites[j], default_dns));
+            }
+
+            std::vector<SiteMetrics> batch_results;
+            for (auto& f : futures) {
+                batch_results.push_back(f.get());
+            }
+
+            batch_done = true;
+            if (spinner_thread.joinable()) spinner_thread.join();
+
+            for (const auto& m : batch_results) {
+                results.push_back(m);
+                printSiteData(m);
+            }
         }
-        
-        metrics.dns_resolution_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
 
-        results.push_back(metrics);
-        printSiteData(metrics);
+        std::cout << "---------------------------------------------------------------------" << std::endl;
+        std::cout << "Saving results to network_data.json..." << std::endl;
+
+        std::ofstream file("network_data.json");
+        if (!file.is_open()) {
+            std::cerr << "Error: Could not create network_data.json" << std::endl;
+            return 1;
+        }
+        file << "[\n";
+        for (size_t i = 0; i < results.size(); ++i) {
+            const auto& r = results[i];
+            std::string status = r.unreachable ? "unreachable" : (r.packet_loss > 0 ? "degraded" : "online");
+
+            file << "  {\n";
+            file << "    \"domain\": \"" << escape_json(r.domain) << "\",\n";
+            file << "    \"status\": \"" << status << "\",\n";
+            file << "    \"latency\": {\n";
+            file << "      \"min\": " << r.min_lat << ",\n";
+            file << "      \"avg\": " << r.avg_lat << ",\n";
+            file << "      \"max\": " << r.max_lat << "\n";
+            file << "    },\n";
+            file << "    \"jitter\": " << std::fixed << std::setprecision(2) << r.jitter << ",\n";
+            file << "    \"packet_loss\": " << r.packet_loss << ",\n";
+            file << "    \"dns\": {\n";
+            file << "      \"server_address\": \"" << escape_json(r.dns_server_address) << "\",\n";
+            if (r.dns_success) {
+                file << "      \"resolution_time_ms\": " << std::fixed << std::setprecision(2) << r.dns_resolution_time_ms << "\n";
+            } else {
+                file << "      \"resolution_time_ms\": null\n";
+            }
+            file << "    }\n";
+            file << "  }" << (i == results.size() - 1 ? "" : ",") << "\n";
+        }
+        file << "]";
+        file.close();
+
+        std::cout << "Done! Press Enter to exit." << std::endl;
+        std::cin.get();
+
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal error: " << e.what() << std::endl;
+        return 1;
     }
 
-    std::cout << "----------------------------------------------------------------" << std::endl;
-    std::cout << "Saving results to network_data.json..." << std::endl;
-
-    std::ofstream file("network_data.json");
-    file << "[\n";
-    for (size_t i = 0; i < results.size(); ++i) {
-        const auto& r = results[i];
-        file << "  {\n";
-        file << "    \"domain\": \"" << r.domain << "\",\n";
-        file << "    \"latency\": {\n";
-        file << "      \"min\": " << r.min_lat << ",\n";
-        file << "      \"avg\": " << r.avg_lat << ",\n";
-        file << "      \"max\": " << r.max_lat << "\n";
-        file << "    },\n";
-        file << "    \"jitter\": " << std::fixed << std::setprecision(2) << r.jitter << ",\n";
-        file << "    \"packet_loss\": " << r.packet_loss << ",\n";
-        file << "    \"dns\": {\n";
-        file << "      \"server_address\": \"" << r.dns_server_address << "\",\n";
-        file << "      \"resolution_time_ms\": " << std::fixed << std::setprecision(2) << r.dns_resolution_time_ms << "\n";
-        file << "    }\n";
-        file << "  }" << (i == results.size() - 1 ? "" : ",") << "\n";
-    }
-    file << "]";
-    file.close();
-
-    std::cout << "Done! Press Enter to exit." << std::endl;
-    std::cin.get();
-
-    WSACleanup();
     return 0;
 }
