@@ -12,7 +12,6 @@
 #include <iomanip>
 #include <chrono>
 #include <winsock2.h>
-#include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <future>
 #include <thread>
@@ -31,10 +30,7 @@ struct SiteMetrics {
     double max_lat = 0;
     double jitter = 0;
     int packet_loss = 0;
-    std::string dns_server_address;
-    double dns_resolution_time_ms = 0;
     bool unreachable = false;
-    bool dns_success = false;
 };
 
 class WSASession {
@@ -116,18 +112,18 @@ void parsePing(const std::string& output, SiteMetrics& metrics) {
         metrics.jitter = total_diff / (latencies.size() - 1);
     }
 
-    std::regex summary_regex;
-    if (is_english) {
-        summary_regex = std::regex("Minimum = ([0-9]+)ms, Maximum = ([0-9]+)ms, Average = ([0-9]+)ms");
-    } else {
-        summary_regex = std::regex("M[íi]nimo = ([0-9]+)ms, M[áa]ximo = ([0-9]+)ms, M[ée]dia = ([0-9]+)ms");
-    }
-
-    std::smatch summary_match;
-    if (std::regex_search(output, summary_match, summary_regex)) {
-        metrics.min_lat = std::stod(summary_match[1].str());
-        metrics.max_lat = std::stod(summary_match[2].str());
-        metrics.avg_lat = std::stod(summary_match[3].str());
+    if (!latencies.empty()) {
+        double min_val = latencies[0];
+        double max_val = latencies[0];
+        double sum = 0;
+        for (double l : latencies) {
+            if (l < min_val) min_val = l;
+            if (l > max_val) max_val = l;
+            sum += l;
+        }
+        metrics.min_lat = min_val;
+        metrics.max_lat = max_val;
+        metrics.avg_lat = sum / latencies.size();
     }
 
     std::regex loss_regex("\\(([0-9]+)%");
@@ -137,36 +133,15 @@ void parsePing(const std::string& output, SiteMetrics& metrics) {
     }
 }
 
-std::string getDnsServer() {
-    std::string dns_server = "Unknown";
-    ULONG ulOutBufLen = sizeof(FIXED_INFO);
-    FIXED_INFO *pFixedInfo = (FIXED_INFO *) malloc(ulOutBufLen);
-    
-    if (!pFixedInfo) return dns_server;
-
-    if (GetNetworkParams(pFixedInfo, &ulOutBufLen) == ERROR_BUFFER_OVERFLOW) {
-        free(pFixedInfo);
-        pFixedInfo = (FIXED_INFO *) malloc(ulOutBufLen);
-        if (!pFixedInfo) return dns_server;
-    }
-    
-    if (GetNetworkParams(pFixedInfo, &ulOutBufLen) == NO_ERROR) {
-        dns_server = pFixedInfo->DnsServerList.IpAddress.String;
-    }
-    free(pFixedInfo);
-    return dns_server;
-}
-
 void printDashboardHeader() {
     std::cout << "\n================================================================" << std::endl;
     std::cout << " NETWORK DATA COLLECTOR v1.1 " << std::endl;
     std::cout << "================================================================" << std::endl;
     std::cout << std::left << std::setw(25) << "Domain" 
-              << std::setw(15) << "Lat(min/avg/max)" 
+              << std::setw(20) << "Lat(min/avg/max)" 
               << std::setw(10) << "Jitter" 
-              << std::setw(8) << "Loss" 
-              << "DNS Time" << std::endl;
-    std::cout << "---------------------------------------------------------------------" << std::endl;
+              << std::setw(8) << "Loss" << std::endl;
+    std::cout << "---------------------------------------------------------------------------" << std::endl;
 }
 
 void printSiteData(const SiteMetrics& m) {
@@ -178,13 +153,10 @@ void printSiteData(const SiteMetrics& m) {
         lat_str = std::to_string((int)m.min_lat) + "/" + std::to_string((int)m.avg_lat) + "/" + std::to_string((int)m.max_lat);
     }
 
-    std::string dns_time = m.dns_success ? (std::to_string((int)m.dns_resolution_time_ms) + "ms") : "N/A";
-
     std::cout << std::left << std::setw(25) << m.domain 
-              << std::setw(15) << lat_str
+              << std::setw(20) << lat_str
               << std::fixed << std::setprecision(1) << std::setw(10) << m.jitter
-              << std::setw(8) << (std::to_string(m.packet_loss) + "%")
-              << dns_time << std::endl;
+              << std::setw(8) << (std::to_string(m.packet_loss) + "%") << std::endl;
 }
 
 void showSpinner(std::atomic<bool>& done, const std::string& msg) {
@@ -204,7 +176,7 @@ void showSpinner(std::atomic<bool>& done, const std::string& msg) {
     }
 }
 
-SiteMetrics processSite(const std::string& domain, const std::string& default_dns) {
+SiteMetrics processSite(const std::string& domain) {
     SiteMetrics metrics;
     metrics.domain = domain;
 
@@ -217,44 +189,6 @@ SiteMetrics processSite(const std::string& domain, const std::string& default_dn
     std::string ping_cmd = "ping " + domain + " -n 20";
     std::string ping_out = exec(ping_cmd.c_str());
     parsePing(ping_out, metrics);
-
-    metrics.dns_server_address = default_dns;
-
-    std::regex ip_regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}$");
-    if (std::regex_match(domain, ip_regex)) {
-        metrics.dns_success = false;
-        return metrics;
-    }
-
-    auto shared_hints = std::make_shared<addrinfo>();
-    
-    ZeroMemory(shared_hints.get(), sizeof(addrinfo));
-    shared_hints->ai_family = AF_UNSPEC;
-    shared_hints->ai_socktype = SOCK_STREAM;
-    shared_hints->ai_protocol = IPPROTO_TCP;
-
-    struct DnsTaskResult { int ret; double duration_ms; };
-    auto dns_future = std::async(std::launch::async, [=]() {
-        auto start = std::chrono::high_resolution_clock::now();
-        struct addrinfo* res = nullptr;
-        int r = getaddrinfo(domain.c_str(), "80", shared_hints.get(), &res);
-        auto end = std::chrono::high_resolution_clock::now();
-        double ms = std::chrono::duration<double, std::milli>(end - start).count();
-        if (res) freeaddrinfo(res);
-        return DnsTaskResult{r, ms};
-    });
-
-    if (dns_future.wait_for(std::chrono::seconds(5)) == std::future_status::timeout) {
-        metrics.dns_success = false;
-    } else {
-        DnsTaskResult res = dns_future.get();
-        if (res.ret == 0) {
-            metrics.dns_success = true;
-            metrics.dns_resolution_time_ms = res.duration_ms;
-        } else {
-            metrics.dns_success = false;
-        }
-    }
 
     return metrics;
 }
@@ -273,7 +207,7 @@ int main() {
             "speed.cloudflare.com",
             "youtube.com",
             "fast.com",
-            "amazon.com.br",
+            "www.mercadolivre.com.br",
             "globo.com",
             "instagram.com",
             "steampowered.com",
@@ -282,7 +216,6 @@ int main() {
         };
 
         std::vector<SiteMetrics> results;
-        std::string default_dns = getDnsServer();
 
         printDashboardHeader();
 
@@ -294,7 +227,7 @@ int main() {
             std::thread spinner_thread(showSpinner, std::ref(batch_done), batch_msg);
 
             for (size_t j = i; j < i + 5 && j < sites.size(); ++j) {
-                futures.push_back(std::async(std::launch::async, processSite, sites[j], default_dns));
+                futures.push_back(std::async(std::launch::async, processSite, sites[j]));
             }
 
             std::vector<SiteMetrics> batch_results;
@@ -333,15 +266,7 @@ int main() {
             file << "      \"max\": " << r.max_lat << "\n";
             file << "    },\n";
             file << "    \"jitter\": " << std::fixed << std::setprecision(2) << r.jitter << ",\n";
-            file << "    \"packet_loss\": " << r.packet_loss << ",\n";
-            file << "    \"dns\": {\n";
-            file << "      \"server_address\": \"" << escape_json(r.dns_server_address) << "\",\n";
-            if (r.dns_success) {
-                file << "      \"resolution_time_ms\": " << std::fixed << std::setprecision(2) << r.dns_resolution_time_ms << "\n";
-            } else {
-                file << "      \"resolution_time_ms\": null\n";
-            }
-            file << "    }\n";
+            file << "    \"packet_loss\": " << r.packet_loss << "\n";
             file << "  }" << (i == results.size() - 1 ? "" : ",") << "\n";
         }
         file << "]";
