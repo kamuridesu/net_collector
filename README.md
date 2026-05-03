@@ -1,6 +1,6 @@
 # Network Data Collector
 
-A C++ tool designed to collect basic network metrics. This tool is specifically tailored for evaluating internet service provider (ISP) quality by measuring latency, jitter, and DNS performance across popular web services.
+A C++ tool designed to collect basic network metrics. This tool is specifically tailored for evaluating internet service provider (ISP) quality by measuring latency jitter, and packet loss across popular web services.
 
 <img width="616" height="309" alt="image" src="https://github.com/user-attachments/assets/da5ad11c-4be8-4a04-b37e-3653f6dd96d1" />
 
